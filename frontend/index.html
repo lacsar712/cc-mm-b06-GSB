@@ -9,9 +9,18 @@
     main { max-width: 760px; margin: 20px auto; padding: 0 12px; }
     input, button { padding: 8px; margin-right: 8px; }
     .alarm { color: #fca5a5; } .ok { color: #86efac; }
+    .stale { color: #fca5a5; font-weight: bold; } .fresh { color: #86efac; }
     #live { min-height: 1.4em; }
+    #searchbar { margin: 12px 0; }
+    #searchMsg { color: #fbbf24; }
     table { width: 100%; border-collapse: collapse; }
     td, th { border-bottom: 1px solid #57534e; padding: 6px; text-align: left; }
+    #dossierPanel { margin-top: 28px; }
+    #dossierList { list-style: none; padding: 0; }
+    #dossierList li { padding: 4px 0; }
+    .cols { display: flex; gap: 24px; }
+    .cols > div { flex: 1; }
+    .cols h5 { margin: 8px 0; }
   </style>
 </head>
 <body>
@@ -35,7 +44,32 @@
         <input id="ch4" type="number" step="0.01" placeholder="甲烷 %" />
         <button>上报</button>
       </form>
-      <table><thead><tr><th>测点</th><th>甲烷 %</th><th>状态</th><th>说明</th></tr></thead><tbody id="rows"></tbody></table>
+      <div id="searchbar">
+        <input id="q" placeholder="测点名片段，如：回风" />
+        <button id="doSearch">检索</button>
+        <button id="saveDossier">存为卷宗</button>
+        <button id="showAll">全部</button>
+        <span id="searchMsg"></span>
+      </div>
+      <table><thead><tr><th>测点</th><th>甲烷 %</th><th>状态</th><th>说明</th><th>操作</th></tr></thead><tbody id="rows"></tbody></table>
+      <section id="dossierPanel">
+        <h3>检索卷宗</h3>
+        <ul id="dossierList"></ul>
+        <div id="dossierView" hidden>
+          <h4 id="dvTitle"></h4>
+          <p id="dvMeta"></p>
+          <div class="cols">
+            <div>
+              <h5>存档主键</h5>
+              <table><thead><tr><th>主键</th><th>测点(现名)</th><th>状态</th></tr></thead><tbody id="archivedRows"></tbody></table>
+            </div>
+            <div>
+              <h5>此刻重查主键</h5>
+              <table><thead><tr><th>主键</th><th>测点</th><th>状态</th></tr></thead><tbody id="currentRows"></tbody></table>
+            </div>
+          </div>
+        </div>
+      </section>
     </section>
   </main>
   <script src="/app.js"></script>

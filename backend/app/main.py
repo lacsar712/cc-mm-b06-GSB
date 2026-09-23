@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timedelta, timezone
 
 from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status
@@ -6,7 +7,7 @@ from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
-from sqlalchemy import DateTime, Float, String, create_engine
+from sqlalchemy import DateTime, Float, String, Text, create_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from app.rules import classify
@@ -44,6 +45,15 @@ class Reading(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
+class Dossier(Base):
+    __tablename__ = "dossiers"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    fragment: Mapped[str] = mapped_column(String(80))
+    hit_ids: Mapped[str] = mapped_column(Text)  # JSON 数组，存档的 readings 主键
+    created_by: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class LoginIn(BaseModel):
     username: str
     password: str
@@ -52,6 +62,14 @@ class LoginIn(BaseModel):
 class ReadingIn(BaseModel):
     site: str = Field(min_length=1, max_length=80)
     ch4_pct: float
+
+
+class ReadingRenameIn(BaseModel):
+    site: str = Field(min_length=1, max_length=80)
+
+
+class DossierIn(BaseModel):
+    fragment: str = Field(min_length=1, max_length=80)
 
 
 def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(security)) -> dict:
@@ -75,6 +93,42 @@ def require_writer(user: dict = Depends(current_user)) -> dict:
 
 sockets: set[WebSocket] = set()
 app = FastAPI(title="矿井瓦斯班测台")
+
+
+def reading_dict(r: Reading) -> dict:
+    return {
+        "id": r.id,
+        "site": r.site,
+        "ch4_pct": r.ch4_pct,
+        "level": r.level,
+        "note": r.note,
+        "created_by": r.created_by,
+    }
+
+
+def dossier_summary(d: Dossier) -> dict:
+    return {
+        "id": d.id,
+        "fragment": d.fragment,
+        "hit_ids": json.loads(d.hit_ids),
+        "created_by": d.created_by,
+        "created_at": d.created_at.isoformat(),
+    }
+
+
+def find_matches(db: Session, fragment: str) -> list[Reading]:
+    return db.query(Reading).filter(Reading.site.contains(fragment)).order_by(Reading.id.asc()).all()
+
+
+async def broadcast(payload: dict):
+    dead = []
+    for ws in list(sockets):
+        try:
+            await ws.send_json(payload)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        sockets.discard(ws)
 
 
 @app.on_event("startup")
@@ -125,17 +179,20 @@ def list_readings(_user: dict = Depends(current_user)):
     db = SessionLocal()
     try:
         rows = db.query(Reading).order_by(Reading.id.desc()).all()
-        return [
-            {
-                "id": r.id,
-                "site": r.site,
-                "ch4_pct": r.ch4_pct,
-                "level": r.level,
-                "note": r.note,
-                "created_by": r.created_by,
-            }
-            for r in rows
-        ]
+        return [reading_dict(r) for r in rows]
+    finally:
+        db.close()
+
+
+@app.get("/api/readings/search")
+def search_readings(q: str = "", _user: dict = Depends(current_user)):
+    fragment = q.strip()
+    if not fragment:
+        raise HTTPException(status_code=400, detail="请输入测点名片段")
+    db = SessionLocal()
+    try:
+        # 只返回片段命中行；无命中就是空列表，绝不明里暗里回退成全表
+        return [reading_dict(r) for r in find_matches(db, fragment)]
     finally:
         db.close()
 
@@ -156,18 +213,99 @@ async def create_reading(body: ReadingIn, user: dict = Depends(require_writer)):
         db.add(row)
         db.commit()
         db.refresh(row)
-        payload = {"id": row.id, "site": row.site, "ch4_pct": row.ch4_pct, "level": row.level, "note": row.note}
+        payload = {"kind": "create", **reading_dict(row)}
     finally:
         db.close()
-    dead = []
-    for ws in list(sockets):
-        try:
-            await ws.send_json(payload)
-        except Exception:
-            dead.append(ws)
-    for ws in dead:
-        sockets.discard(ws)
+    await broadcast(payload)
     return payload
+
+
+@app.patch("/api/readings/{reading_id}")
+async def rename_reading(reading_id: int, body: ReadingRenameIn, user: dict = Depends(require_writer)):
+    db = SessionLocal()
+    try:
+        row = db.get(Reading, reading_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="测点记录不存在")
+        row.site = body.site.strip()
+        db.commit()
+        db.refresh(row)
+        payload = {"kind": "update", **reading_dict(row)}
+    finally:
+        db.close()
+    await broadcast(payload)
+    return payload
+
+
+@app.post("/api/dossiers", status_code=201)
+def create_dossier(body: DossierIn, user: dict = Depends(current_user)):
+    fragment = body.fragment.strip()
+    if not fragment:
+        raise HTTPException(status_code=400, detail="请输入测点名片段")
+    db = SessionLocal()
+    try:
+        hits = find_matches(db, fragment)
+        if not hits:
+            raise HTTPException(status_code=404, detail="无匹配测点")
+        dossier = Dossier(
+            fragment=fragment,
+            hit_ids=json.dumps([r.id for r in hits]),
+            created_by=user["username"],
+            created_at=datetime.now(timezone.utc),
+        )
+        db.add(dossier)
+        db.commit()
+        db.refresh(dossier)
+        return dossier_summary(dossier)
+    finally:
+        db.close()
+
+
+@app.get("/api/dossiers")
+def list_dossiers(_user: dict = Depends(current_user)):
+    db = SessionLocal()
+    try:
+        rows = db.query(Dossier).order_by(Dossier.id.desc()).all()
+        return [dossier_summary(d) for d in rows]
+    finally:
+        db.close()
+
+
+@app.get("/api/dossiers/{dossier_id}")
+def open_dossier(dossier_id: int, _user: dict = Depends(current_user)):
+    db = SessionLocal()
+    try:
+        dossier = db.get(Dossier, dossier_id)
+        if dossier is None:
+            raise HTTPException(status_code=404, detail="卷宗不存在")
+        archived_ids = json.loads(dossier.hit_ids)
+        # 此刻按存档时的同一片段重查
+        current_rows = find_matches(db, dossier.fragment)
+        current_ids = {r.id for r in current_rows}
+        archived_rows = {}
+        if archived_ids:
+            archived_rows = {r.id: r for r in db.query(Reading).filter(Reading.id.in_(archived_ids)).all()}
+        archived = []
+        for rid in archived_ids:
+            row = archived_rows.get(rid)
+            still_hit = rid in current_ids
+            archived.append(
+                {
+                    "reading_id": rid,
+                    "status": "有效" if still_hit else "失效",
+                    "site": row.site if row else None,
+                    "ch4_pct": row.ch4_pct if row else None,
+                    "level": row.level if row else None,
+                }
+            )
+        return {
+            **dossier_summary(dossier),
+            "archived": archived,
+            "current_ids": [r.id for r in current_rows],
+            "current": [reading_dict(r) for r in current_rows],
+        }
+    finally:
+        db.close()
 
 
 @app.websocket("/ws/alerts")
